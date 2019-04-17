@@ -25,24 +25,47 @@ import { WebviewWidget } from './webview/webview';
 import { ThemeService } from '@theia/core/lib/browser/theming';
 import { ThemeRulesService } from './webview/theme-rules-service';
 import { DisposableCollection } from '@theia/core';
+import { ViewColumnService } from './view-column-service';
 
 export class WebviewsMainImpl implements WebviewsMain {
+    private readonly revivers = new Set<string>();
     private readonly proxy: WebviewsExt;
     protected readonly shell: ApplicationShell;
+    protected readonly viewColumnService: ViewColumnService;
     protected readonly keybindingRegistry: KeybindingRegistry;
     protected readonly themeService = ThemeService.get();
     protected readonly themeRulesService = ThemeRulesService.get();
 
     private readonly views = new Map<string, WebviewWidget>();
+    private readonly viewsOptions = new Map<string, { panelOptions: WebviewPanelShowOptions; panelId: string; active: boolean; visible: boolean; }>();
 
     constructor(rpc: RPCProtocol, container: interfaces.Container) {
         this.proxy = rpc.getProxy(MAIN_RPC_CONTEXT.WEBVIEWS_EXT);
         this.shell = container.get(ApplicationShell);
         this.keybindingRegistry = container.get(KeybindingRegistry);
+        this.viewColumnService = container.get(ViewColumnService);
+
+        let timeoutHandle: NodeJS.Timer | undefined;
+        const updateOptions = () => {
+            if (!this.viewsOptions.size) {
+                return;
+            }
+            if (timeoutHandle) {
+                clearTimeout(timeoutHandle);
+            }
+            timeoutHandle = setTimeout(() => {
+                for (const key of this.viewsOptions.keys()) {
+                    this.updateViewsState(key);
+                }
+            }, 100);
+        };
+        this.shell.activeChanged.connect(() => updateOptions());
+        this.shell.currentChanged.connect(() => updateOptions());
+        this.viewColumnService.onViewColumnChanged(() => updateOptions());
     }
 
     $createWebviewPanel(
-        viewId: string,
+        panelId: string,
         viewType: string,
         title: string,
         showOptions: WebviewPanelShowOptions,
@@ -54,7 +77,7 @@ export class WebviewsMainImpl implements WebviewsMain {
             allowScripts: options ? options.enableScripts : false
         }, {
                 onMessage: m => {
-                    this.proxy.$onMessage(viewId, m);
+                    this.proxy.$onMessage(panelId, m);
                 },
                 onKeyboardEvent: e => {
                     this.keybindingRegistry.run(e);
@@ -71,7 +94,7 @@ export class WebviewsMainImpl implements WebviewsMain {
                         const parent = contentDocument.head ? contentDocument.head : contentDocument.body;
                         styleElement = this.themeRulesService.createStyleSheet(parent);
                         styleElement.id = styleId;
-                        parent.appendChild((styleElement));
+                        parent.appendChild(styleElement);
                     }
 
                     this.themeRulesService.setRules(styleElement, this.themeRulesService.getCurrentThemeRules());
@@ -82,22 +105,55 @@ export class WebviewsMainImpl implements WebviewsMain {
             });
         view.disposed.connect(() => {
             toDispose.dispose();
-            this.onCloseView(viewId);
+            this.onCloseView(panelId);
         });
-        this.views.set(viewId, view);
+
+        this.views.set(panelId, view);
+        this.viewsOptions.set(view.id, { panelOptions: showOptions, panelId: panelId, visible: false, active: false });
+        this.addOrReattachWidget(panelId, showOptions);
+    }
+    private addOrReattachWidget(handler: string, showOptions: WebviewPanelShowOptions) {
+        const view = this.views.get(handler);
+        if (!view) {
+            return;
+        }
         const widgetOptions: ApplicationShell.WidgetOptions = { area: showOptions.area ? showOptions.area : 'main' };
-        // FIXME translate all view columns properly
+
+        let mode = 'open-to-right';
         if (showOptions.viewColumn === -2) {
             const ref = this.shell.currentWidget;
             if (ref && this.shell.getAreaFor(ref) === widgetOptions.area) {
-                Object.assign(widgetOptions, { ref, mode: 'open-to-right' });
+                Object.assign(widgetOptions, { ref, mode });
+            }
+        } else if (widgetOptions.area === 'main' && showOptions.viewColumn !== undefined) {
+            this.viewColumnService.updateViewColumns();
+            let widgetIds = this.viewColumnService.getViewColumnIds(showOptions.viewColumn);
+            if (widgetIds.length > 0) {
+                mode = 'tab-after';
+            } else if (showOptions.viewColumn > 0) {
+                widgetIds = this.viewColumnService.getViewColumnIds(showOptions.viewColumn - 1);
+            }
+            const ref = this.shell.getWidgets(widgetOptions.area).find(widget => widget.isVisible && widgetIds.indexOf(widget.node.id) !== -1);
+            if (ref) {
+                Object.assign(widgetOptions, { ref, mode });
             }
         }
+
         this.shell.addWidget(view, widgetOptions);
+        const visible = true;
+        let active: boolean;
         if (showOptions.preserveFocus) {
             this.shell.revealWidget(view.id);
+            active = false;
         } else {
             this.shell.activateWidget(view.id);
+            active = true;
+        }
+        const options = this.viewsOptions.get(view.id);
+        if (options) {
+            options.panelOptions = showOptions;
+            options.visible = visible;
+            options.active = active;
         }
     }
     $disposeWebview(handle: string): void {
@@ -107,15 +163,26 @@ export class WebviewsMainImpl implements WebviewsMain {
         }
     }
     $reveal(handle: string, showOptions: WebviewPanelShowOptions): void {
-        const webview = this.getWebview(handle);
-        if (webview.isDisposed) {
+        const view = this.getWebview(handle);
+        if (view.isDisposed) {
             return;
         }
-        // FIXME handle view column here too!
+        if (showOptions.viewColumn !== undefined || (showOptions.area !== undefined && showOptions.area !== 'main')) {
+            this.viewColumnService.updateViewColumns();
+            const options = this.viewsOptions.get(view.id);
+            if (!options) {
+                return;
+            }
+            const columnIds = showOptions.viewColumn ? this.viewColumnService.getViewColumnIds(showOptions.viewColumn) : [];
+            if (columnIds.indexOf(view.id) === -1 || options.panelOptions.area !== showOptions.area) {
+                this.addOrReattachWidget(options.panelId, showOptions);
+                return;
+            }
+        }
         if (showOptions.preserveFocus) {
-            this.shell.revealWidget(webview.id);
+            this.shell.revealWidget(view.id);
         } else {
-            this.shell.activateWidget(webview.id);
+            this.shell.activateWidget(view.id);
         }
     }
     $setTitle(handle: string, value: string): void {
@@ -144,10 +211,32 @@ export class WebviewsMainImpl implements WebviewsMain {
         return Promise.resolve(webview !== undefined);
     }
     $registerSerializer(viewType: string): void {
-        throw new Error('Method not implemented.');
+        this.revivers.add(viewType);
     }
     $unregisterSerializer(viewType: string): void {
-        throw new Error('Method not implemented.');
+        this.revivers.delete(viewType);
+    }
+
+    private updateViewsState(handler: string): void {
+        const options = this.viewsOptions.get(handler);
+        if (!options || !options.panelOptions) {
+            return;
+        }
+        const view = this.views.get(options.panelId);
+        if (!view) {
+            return;
+        }
+        const active = !!this.shell.activeWidget ? this.shell.activeWidget.id === view!.id : false;
+        const visible = view!.isVisible;
+        this.viewColumnService.updateViewColumns();
+        const viewColumn = this.viewColumnService.hasViewColumn(view.id) ? this.viewColumnService.getViewColumn(view.id)! : 0;
+        if (options.panelOptions.viewColumn === viewColumn && options.visible === visible && options.active === active) {
+            return;
+        }
+        options.active = active;
+        options.visible = visible;
+        options.panelOptions.viewColumn = viewColumn;
+        this.proxy.$onDidChangeWebviewPanelViewState(options.panelId, { active, visible, position: viewColumn });
     }
 
     private getWebview(viewId: string): WebviewWidget {
@@ -165,6 +254,7 @@ export class WebviewsMainImpl implements WebviewsMain {
         }
         const cleanUp = () => {
             this.views.delete(viewId);
+            this.viewsOptions.delete(viewId);
         };
         this.proxy.$onDidDisposeWebviewPanel(viewId).then(cleanUp, cleanUp);
     }
